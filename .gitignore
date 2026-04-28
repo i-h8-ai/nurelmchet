@@ -1,0 +1,12 @@
+# Build output
+nurealmschat
+src/*.o
+
+# Environment / secrets
+.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
