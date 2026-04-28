@@ -1,3 +1,4 @@
 #pragma once
 #include "chat.h"
-int gui_run(ChatState *state);
+#include "config.h"
+int gui_run(ChatState *state, const AppConfig *cfg);

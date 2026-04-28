@@ -11,8 +11,9 @@
 
 #include "chat.h"
 #include "ws.h"
+#include "imgcache.h"
 
-#define WS_BUFSIZE (256 * 1024)
+#define WS_INITIAL_BUFSIZE (256 * 1024)
 
 static void ws_send_json(CURL *curl, cJSON *obj) {
     char *s = cJSON_PrintUnformatted(obj);
@@ -79,6 +80,15 @@ static void handle_participants(ChatState *state, cJSON *root) {
     pthread_mutex_unlock(&state->lock);
 }
 
+/* Extract filename-without-extension from a URL path like "/uploads/avatars/abc123.png" */
+static void url_basename_noext(char *dst, size_t dstlen, const char *url_path) {
+    const char *slash = strrchr(url_path, '/');
+    const char *name  = slash ? slash + 1 : url_path;
+    strncpy(dst, name, dstlen - 1);
+    char *dot = strrchr(dst, '.');
+    if (dot) *dot = 0;
+}
+
 static ChatMessage parse_chat_msg(cJSON *m) {
     ChatMessage cm = {0};
     cJSON *u    = cJSON_GetObjectItem(m, "username");
@@ -87,30 +97,127 @@ static ChatMessage parse_chat_msg(cJSON *m) {
     cJSON *col  = cJSON_GetObjectItem(m, "userColor");
     cJSON *cust = cJSON_GetObjectItem(m, "useCustomColor");
     cJSON *ts   = cJSON_GetObjectItem(m, "timestamp");
+    cJSON *av   = cJSON_GetObjectItem(m, "avatarUrl");
+    cJSON *rs   = cJSON_GetObjectItem(m, "resolvedStickers");
+
     if (u   && u->valuestring) strncpy(cm.username, u->valuestring, sizeof(cm.username) - 1);
     if (c   && c->valuestring) strncpy(cm.content,  c->valuestring, sizeof(cm.content)  - 1);
     if (r   && r->valuestring) strncpy(cm.realm,    r->valuestring, sizeof(cm.realm)    - 1);
     if (col && col->valuestring) strncpy(cm.color,  col->valuestring, sizeof(cm.color)  - 1);
+    if (av  && av->valuestring)  strncpy(cm.avatar_url, av->valuestring, sizeof(cm.avatar_url) - 1);
     cm.use_custom_color = cJSON_IsTrue(cust);
     cm.timestamp = (ts && cJSON_IsNumber(ts)) ? (long long)ts->valuedouble : 0LL;
+
+    /* parse {"stickerName": "/uploads/stickers/foo.gif", ...} */
+    if (cJSON_IsObject(rs)) {
+        cJSON *item;
+        cJSON_ArrayForEach(item, rs) {
+            if (cm.sticker_count >= MAX_STICKERS_PER_MSG) break;
+            if (!item->string || !item->valuestring) continue;
+            StickerRef *ref = &cm.stickers[cm.sticker_count++];
+            strncpy(ref->name,     item->string,      sizeof(ref->name)     - 1);
+            strncpy(ref->url_path, item->valuestring, sizeof(ref->url_path) - 1);
+        }
+    }
+
+    /* queue downloads immediately while on the WS thread */
+    if (cm.avatar_url[0]) {
+        char av_name[128];
+        url_basename_noext(av_name, sizeof(av_name), cm.avatar_url);
+        imgcache_request(av_name, cm.avatar_url, IMG_AVATAR);
+    }
+    for (int i = 0; i < cm.sticker_count; i++)
+        imgcache_request(cm.stickers[i].name, cm.stickers[i].url_path, IMG_STICKER);
+
     return cm;
 }
 
-static void ingest_messages(ChatState *state, cJSON *msgs) {
-    if (!cJSON_IsArray(msgs)) return;
+static void ingest_messages(ChatState *state, cJSON *root_or_array) {
+    /* server may put messages under various field names */
+    cJSON *msgs = root_or_array;
+    if (!cJSON_IsArray(msgs)) {
+        const char *fields[] = {
+            "messages", "data", "history", "chatMessages",
+            "chatHistory", "items", "results", NULL
+        };
+        for (int fi = 0; fields[fi]; fi++) {
+            cJSON *f = cJSON_GetObjectItem(root_or_array, fields[fi]);
+            if (cJSON_IsArray(f)) { msgs = f; break; }
+        }
+        /* fallback: pick first array-typed field we find */
+        if (!cJSON_IsArray(msgs) && cJSON_IsObject(root_or_array)) {
+            cJSON *child;
+            cJSON_ArrayForEach(child, root_or_array) {
+                if (cJSON_IsArray(child)) {
+                    fprintf(stderr, "[ws] ingest_messages: using fallback field '%s'\n",
+                            child->string ? child->string : "?");
+                    fflush(stderr);
+                    msgs = child;
+                    break;
+                }
+            }
+        }
+    }
+    if (!cJSON_IsArray(msgs)) {
+        /* log top-level keys to help diagnose */
+        fprintf(stderr, "[ws] ingest_messages: no messages array; root keys:");
+        if (cJSON_IsObject(root_or_array)) {
+            cJSON *child;
+            cJSON_ArrayForEach(child, root_or_array)
+                fprintf(stderr, " %s", child->string ? child->string : "?");
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+        return;
+    }
     int n = cJSON_GetArraySize(msgs);
-    chat_add_system(state, "── history (%d messages) ──", n);
-    cJSON *m;
-    cJSON_ArrayForEach(m, msgs) {
-        ChatMessage cm = parse_chat_msg(m);
-        chat_add_message(state, &cm);
+
+    /* Parse into temp batch so we can sort by timestamp before adding */
+    ChatMessage *batch = malloc((size_t)n * sizeof(ChatMessage));
+    int bi = 0;
+    if (batch) {
+        cJSON *m;
+        cJSON_ArrayForEach(m, msgs) {
+            if (bi >= n) break;
+            batch[bi++] = parse_chat_msg(m);
+        }
+        /* insertion sort by timestamp ascending; real messages only —
+           timestamp=0 (system) messages keep arrival order at the front */
+        for (int i = 1; i < bi; i++) {
+            ChatMessage tmp = batch[i];
+            int j = i - 1;
+            while (j >= 0 && tmp.timestamp > 0 && batch[j].timestamp > tmp.timestamp) {
+                batch[j + 1] = batch[j];
+                j--;
+            }
+            batch[j + 1] = tmp;
+        }
+        chat_add_system(state, "── history (%d messages) ──", bi);
+        for (int i = 0; i < bi; i++)
+            chat_add_message(state, &batch[i]);
+        free(batch);
+        fprintf(stderr, "[ws] ingest: added %d messages to ring buffer\n", bi);
+        fflush(stderr);
+    } else {
+        /* fallback: add in arrival order */
+        chat_add_system(state, "── history (%d messages) ──", n);
+        cJSON *m;
+        cJSON_ArrayForEach(m, msgs) {
+            ChatMessage cm = parse_chat_msg(m);
+            chat_add_message(state, &cm);
+        }
     }
 }
 
 /* curl handle passed in so join_success can fire follow-up sends inline */
 static void process_message(ChatState *state, CURL *curl, const char *json_str) {
     cJSON *root = cJSON_Parse(json_str);
-    if (!root) return;
+    if (!root) {
+        fprintf(stderr, "[ws] cJSON_Parse failed (len=%zu): %.300s\n",
+                strlen(json_str), json_str);
+        fflush(stderr);
+        return;
+    }
 
     cJSON *type_item = cJSON_GetObjectItem(root, "type");
     const char *type = cJSON_GetStringValue(type_item);
@@ -152,6 +259,11 @@ static void process_message(ChatState *state, CURL *curl, const char *json_str) 
 
         obj = cJSON_CreateObject();
         cJSON_AddStringToObject(obj, "type", "get_global_history");
+        cJSON_AddStringToObject(obj, "realmId", realm);
+        pthread_mutex_lock(&state->lock);
+        int lim = state->max_messages > 0 ? state->max_messages : 20;
+        pthread_mutex_unlock(&state->lock);
+        cJSON_AddNumberToObject(obj, "limit", lim);
         ws_send_json(curl, obj);
         cJSON_Delete(obj);
 
@@ -161,8 +273,9 @@ static void process_message(ChatState *state, CURL *curl, const char *json_str) 
         cJSON_Delete(obj);
 
     /* history and global_history both carry a messages array */
-    } else if (strcmp(type, "global_history") == 0 || strcmp(type, "history") == 0) {
-        ingest_messages(state, cJSON_GetObjectItem(root, "messages"));
+    } else if (strcmp(type, "global_history") == 0 || strcmp(type, "history") == 0
+               || strcmp(type, "chat_history") == 0) {
+        ingest_messages(state, root);
 
     /* participants_list is the actual response type (not "participants") */
     } else if (strcmp(type, "participants_list") == 0 || strcmp(type, "participants") == 0) {
@@ -235,14 +348,20 @@ static void do_send_cmd(CURL *curl, Command *cmd, ChatState *state, char *realm,
             cJSON_AddStringToObject(obj, "realmId", r);
             break;
         }
-        case CMD_GET_HISTORY:
+        case CMD_GET_HISTORY: {
             cJSON_AddStringToObject(obj, "type", "set_chat_filter");
             cJSON_AddTrueToObject(obj, "globalChat");
             ws_send_json(curl, obj);
             cJSON_Delete(obj);
             obj = cJSON_CreateObject();
             cJSON_AddStringToObject(obj, "type", "get_global_history");
+            cJSON_AddStringToObject(obj, "realmId", realm);
+            pthread_mutex_lock(&state->lock);
+            int hlim = state->max_messages > 0 ? state->max_messages : 20;
+            pthread_mutex_unlock(&state->lock);
+            cJSON_AddNumberToObject(obj, "limit", hlim);
             break;
+        }
         case CMD_GET_PARTICIPANTS:
             cJSON_AddStringToObject(obj, "type", "get_participants");
             break;
@@ -266,7 +385,8 @@ static void do_send_cmd(CURL *curl, Command *cmd, ChatState *state, char *realm,
 static void *ws_thread_func(void *arg) {
     ChatState *state = (ChatState *)arg;
 
-    char *buf = malloc(WS_BUFSIZE);
+    size_t buf_cap = WS_INITIAL_BUFSIZE;
+    char *buf = malloc(buf_cap);
     if (!buf) return NULL;
 
     char url[sizeof(state->ws_url)];
@@ -383,6 +503,13 @@ static void *ws_thread_func(void *arg) {
         }
 
         /* ── inner recv / send loop ───────────────────────────────────── */
+        /* These persist across select() calls so CURLE_AGAIN mid-message
+           just means "wait for more socket data", not "message complete". */
+        size_t frag_total    = 0;
+        bool   frag_is_text  = false;
+        bool   frag_is_ping  = false;
+        bool   frag_is_close = false;
+
         bool quit = false;
         while (state->running && !quit) {
 
@@ -407,36 +534,72 @@ static void *ws_thread_func(void *arg) {
             if (ready < 0) break;
             if (ready == 0) continue;
 
-            size_t nread = 0;
-            const struct curl_ws_frame *frame = NULL;
-            rc = curl_ws_recv(curl, buf, WS_BUFSIZE - 1, &nread, &frame);
-            if (rc == CURLE_AGAIN) continue;
-            if (rc != CURLE_OK) {
-                fprintf(stderr, "[ws] recv error: %s\n", curl_easy_strerror(rc));
-                fflush(stderr);
-                chat_add_system(state, "Recv error: %s", curl_easy_strerror(rc));
-                break;
+            /* drain all available socket data into buf */
+            bool complete = false;
+            bool recv_err = false;
+
+            while (1) {
+                /* grow buffer if < 64KB headroom remains */
+                if (buf_cap - frag_total < 65536) {
+                    size_t new_cap = buf_cap * 2;
+                    char *new_buf  = realloc(buf, new_cap);
+                    if (!new_buf) {
+                        fprintf(stderr, "[ws] realloc failed at %zu bytes\n", new_cap);
+                        fflush(stderr);
+                        recv_err = true; break;
+                    }
+                    buf     = new_buf;
+                    buf_cap = new_cap;
+                    fprintf(stderr, "[ws] recv buffer grown to %zu KB\n", buf_cap / 1024);
+                    fflush(stderr);
+                }
+                size_t nread = 0;
+                const struct curl_ws_frame *frame = NULL;
+                rc = curl_ws_recv(curl, buf + frag_total,
+                                  buf_cap - 1 - frag_total, &nread, &frame);
+                if (rc == CURLE_AGAIN) break; /* no more data right now; go back to select */
+                if (rc != CURLE_OK) {
+                    fprintf(stderr, "[ws] recv error: %s\n", curl_easy_strerror(rc));
+                    fflush(stderr);
+                    chat_add_system(state, "Recv error: %s", curl_easy_strerror(rc));
+                    recv_err = true; break;
+                }
+                if (frame) {
+                    /* CURLWS_TEXT is only on the first fragment; persist it */
+                    if (frame->flags & CURLWS_TEXT)  frag_is_text  = true;
+                    if (frame->flags & CURLWS_PING)  frag_is_ping  = true;
+                    if (frame->flags & CURLWS_CLOSE) frag_is_close = true;
+                }
+                frag_total += nread;
+                /* complete when no bytes left in this fragment AND not a continuation */
+                if (frame && frame->bytesleft == 0 && !(frame->flags & CURLWS_CONT)) {
+                    complete = true; break;
+                }
             }
-            if (nread == 0) continue; /* empty frame, keep going */
 
-            buf[nread] = 0;
+            if (recv_err) { quit = true; break; }
+            buf[frag_total] = 0;
 
-            if (frame && (frame->flags & CURLWS_TEXT)) {
-                fprintf(stderr, "[ws] recv: %.*s\n", (int)(nread > 400 ? 400 : nread), buf);
-                fflush(stderr);
-                process_message(state, curl, buf);
-            } else if (frame && (frame->flags & CURLWS_PING)) {
-                /* reply with pong so the server doesn't drop us */
-                size_t sent;
-                curl_ws_send(curl, buf, nread, &sent, 0, CURLWS_PONG);
-                fprintf(stderr, "[ws] ping → pong\n");
-                fflush(stderr);
-            } else if (frame && (frame->flags & CURLWS_CLOSE)) {
+            if (frag_is_close) {
                 fprintf(stderr, "[ws] server sent close frame\n");
                 fflush(stderr);
                 chat_add_system(state, "Server closed the connection");
                 break;
+            } else if (frag_is_ping && complete) {
+                size_t sent;
+                curl_ws_send(curl, buf, frag_total, &sent, 0, CURLWS_PONG);
+                fprintf(stderr, "[ws] ping → pong\n");
+                fflush(stderr);
+                frag_total = 0; frag_is_text = frag_is_ping = frag_is_close = false;
+            } else if (frag_is_text && complete) {
+                fprintf(stderr, "[ws] recv (%zu b): %.*s\n",
+                        frag_total, (int)(frag_total > 500 ? 500 : frag_total), buf);
+                fflush(stderr);
+                process_message(state, curl, buf);
+                frag_total = 0; frag_is_text = frag_is_ping = frag_is_close = false;
             }
+            /* if not complete (CURLE_AGAIN mid-message or CONT fragment),
+               frag_total and frag_is_* carry over to the next select() wakeup */
         }
 
         /* ── cleanup this connection ──────────────────────────────────── */
@@ -474,7 +637,6 @@ static void *ws_thread_func(void *arg) {
 static pthread_t g_ws_thread;
 
 void ws_start(ChatState *s) {
-    curl_global_init(CURL_GLOBAL_ALL);
     pthread_create(&g_ws_thread, NULL, ws_thread_func, s);
 }
 
@@ -482,5 +644,4 @@ void ws_stop(ChatState *s) {
     s->running = false;
     chat_push_cmd(s, CMD_QUIT, NULL);
     pthread_join(g_ws_thread, NULL);
-    curl_global_cleanup();
 }

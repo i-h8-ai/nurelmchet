@@ -4,16 +4,25 @@
 #include <stdarg.h>
 #include <stddef.h>
 
-#define MAX_MESSAGES     300
-#define MAX_PARTICIPANTS 100
-#define CMD_QUEUE_SIZE   16
+#define MAX_MESSAGES         300
+#define MAX_PARTICIPANTS     100
+#define CMD_QUEUE_SIZE       16
+#define MAX_STICKERS_PER_MSG 4
+
+typedef struct {
+    char name[64];
+    char url_path[256];
+} StickerRef;
 
 typedef struct {
     char username[64];
     char content[1024];
     char realm[64];
-    char color[8];        /* #RRGGBB or empty */
-    long long timestamp;  /* ms epoch, 0 = system msg */
+    char color[8];             /* #RRGGBB or empty */
+    char avatar_url[256];
+    StickerRef stickers[MAX_STICKERS_PER_MSG];
+    int  sticker_count;
+    long long timestamp;       /* ms epoch, 0 = system msg */
     bool use_custom_color;
 } ChatMessage;
 
@@ -57,6 +66,8 @@ typedef struct {
     char token[2048];
     char apiKey[256];
     char ws_url[256];
+    char base_url[256];
+    int  max_messages;
 
     pthread_mutex_t lock;
     pthread_cond_t  cmd_cond;

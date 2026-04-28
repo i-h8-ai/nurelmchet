@@ -1,0 +1,21 @@
+# nurealmschat.conf — image cache settings
+# Copy to nurealmschat.conf and edit as needed.
+
+# Where to store downloaded stickers and avatars.
+# Subdirs stickers/ and avatars/ are created automatically.
+# cache_dir=~/.cache/nurealmschat
+
+# Max dimension (width and height) for cached sticker images.
+# Aspect ratio is preserved; image is scaled to fit within this box.
+ sticker_size=64
+
+# Max dimension for cached avatar images.
+ avatar_size=32
+
+# Set to false to disable downloading missing stickers/avatars.
+# download_missing_stickers=true
+# download_missing_avatars=true
+
+# Override the base HTTP URL used to fetch images.
+# If omitted, derived automatically from WS_URL (wss://host -> https://host).
+# BASE_URL=https://<TODO: URL_HERE!>
