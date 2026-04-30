@@ -6,8 +6,12 @@
 #include <ctype.h>
 #include <time.h>
 
+#ifdef USE_SDL2
+#include "sdl_compat.h"
+#else
 #include <SDL3/SDL.h>
 #include <SDL3_ttf/SDL_ttf.h>
+#endif
 
 #include "chat.h"
 #include "config.h"
@@ -105,6 +109,16 @@ static bool   g_sb_dragging  = false;
 static bool   g_sb_hovered   = false;
 
 static AppConfig g_cfg;
+
+#ifdef ENABLE_TEXT_SELECT
+/* Ring-buffer index of the selected message, -1 = none */
+static int g_sel_msg_idx = -1;
+
+/* Visible message positions recorded each draw frame for hit-testing */
+typedef struct { float y0, y1; int ring_idx; } VisMsg;
+static VisMsg g_vis_msgs[MAX_MESSAGES];
+static int    g_vis_count = 0;
+#endif
 
 /* ── Timestamp-sorted display ─────────────────────────────────────────── */
 /* g_sort_pos[j] = offset from oldest (0..count-1) for the j-th drawn msg */
@@ -484,6 +498,10 @@ static void draw_messages(ChatState *state) {
     SDL_Rect clip = {0, MSG_Y, g_win_w - SCROLLBAR_W, mh};
     SDL_SetRenderClipRect(g_ren, &clip);
 
+#ifdef ENABLE_TEXT_SELECT
+    g_vis_count = 0;
+#endif
+
     float cum_px = 0;
     for (int j = 0; j < count; j++) {
         int idx = (oldest + g_sort_pos[j]) % MAX_MESSAGES;
@@ -494,6 +512,19 @@ static void draw_messages(ChatState *state) {
         if (cum_px >= vp_top + mh)     break;
 
         float screen_y = (float)MSG_Y + (cum_px - vp_top);
+
+#ifdef ENABLE_TEXT_SELECT
+        /* record for hit-testing */
+        if (g_vis_count < MAX_MESSAGES) {
+            g_vis_msgs[g_vis_count++] = (VisMsg){screen_y, screen_y + msg_h, idx};
+        }
+        /* selection highlight */
+        if (idx == g_sel_msg_idx) {
+            SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+            fill_rect(0, screen_y, (float)(g_win_w - SCROLLBAR_W), msg_h,
+                      (SDL_Color){0x45, 0x85, 0x88, 0x55});
+        }
+#endif
 
         /* ── avatar ── */
         float text_x = (float)MSG_PAD_X;
@@ -640,6 +671,15 @@ int gui_run(ChatState *state, const AppConfig *cfg) {
 
     int init_w = 1000, init_h = 680;
     {
+#ifdef USE_SDL2
+        SDL_DisplayMode dm;
+        if (SDL_GetCurrentDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0) {
+            init_w = (int)(dm.w * 0.82f); if (init_w > 1200) init_w = 1200;
+            init_h = (int)(dm.h * 0.82f); if (init_h > 800)  init_h = 800;
+            int min_h = TITLE_H + BTNBAR_H + g_line_h * 4 + INPUT_H + 10;
+            if (init_h < min_h) init_h = min_h;
+        }
+#else
         SDL_DisplayID disp = SDL_GetPrimaryDisplay();
         const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(disp);
         if (dm && dm->w > 0 && dm->h > 0) {
@@ -648,6 +688,7 @@ int gui_run(ChatState *state, const AppConfig *cfg) {
             int min_h = TITLE_H + BTNBAR_H + g_line_h * 4 + INPUT_H + 10;
             if (init_h < min_h) init_h = min_h;
         }
+#endif
     }
     g_win_w = init_w; g_win_h = init_h;
 
@@ -714,6 +755,18 @@ int gui_run(ChatState *state, const AppConfig *cfg) {
                             int total = state->msg_count;
                             pthread_mutex_unlock(&state->lock);
                             sb_set_scroll_from_mouse(by, total);
+#ifdef ENABLE_TEXT_SELECT
+                        } else if (bx < g_win_w - SCROLLBAR_W &&
+                                   by >= MSG_Y && by < cinput_y()) {
+                            /* click in message area: select that message */
+                            int hit = -1;
+                            for (int vi = 0; vi < g_vis_count; vi++) {
+                                if (by >= g_vis_msgs[vi].y0 && by < g_vis_msgs[vi].y1) {
+                                    hit = g_vis_msgs[vi].ring_idx; break;
+                                }
+                            }
+                            g_sel_msg_idx = hit;
+#endif
                         } else {
                             handle_button_click(bx, by, state);
                         }
@@ -739,8 +792,15 @@ int gui_run(ChatState *state, const AppConfig *cfg) {
                     }
                     break;
 
-                case SDL_EVENT_KEY_DOWN:
-                    switch (ev.key.key) {
+                case SDL_EVENT_KEY_DOWN: {
+#ifdef USE_SDL2
+                    SDL_Keycode key_sym = ev.key.keysym.sym;
+                    int         key_mod = ev.key.keysym.mod;
+#else
+                    SDL_Keycode key_sym = ev.key.key;
+                    int         key_mod = (int)ev.key.mod;
+#endif
+                    switch (key_sym) {
                         case SDLK_RETURN: case SDLK_KP_ENTER:
                             if (g_input_len > 0) {
                                 chat_push_cmd(state, CMD_SEND_MESSAGE, g_input);
@@ -758,9 +818,24 @@ int gui_run(ChatState *state, const AppConfig *cfg) {
                             break;
                         case SDLK_ESCAPE:
                             g_input[0] = 0; g_input_len = 0;
+#ifdef ENABLE_TEXT_SELECT
+                            g_sel_msg_idx = -1;
+#endif
+                            break;
+                        case SDLK_C:
+#ifdef ENABLE_TEXT_SELECT
+                            if ((key_mod & SDL_KMOD_CTRL) && g_sel_msg_idx >= 0) {
+                                pthread_mutex_lock(&state->lock);
+                                ChatMessage msg = state->messages[g_sel_msg_idx];
+                                pthread_mutex_unlock(&state->lock);
+                                char line[1400];
+                                format_msg_line(line, sizeof(line), &msg);
+                                SDL_SetClipboardText(line);
+                            }
+#endif
                             break;
                         case SDLK_V:
-                            if (ev.key.mod & SDL_KMOD_CTRL) {
+                            if (key_mod & SDL_KMOD_CTRL) {
                                 char *clip = SDL_GetClipboardText();
                                 if (clip) {
                                     int add = (int)strlen(clip);
@@ -787,6 +862,7 @@ int gui_run(ChatState *state, const AppConfig *cfg) {
                         default: break;
                     }
                     break;
+                }
 
                 default: break;
             }

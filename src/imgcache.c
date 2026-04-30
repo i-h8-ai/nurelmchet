@@ -10,8 +10,12 @@
 #include <errno.h>
 
 #include <curl/curl.h>
+#ifdef USE_SDL2
+#include "sdl_compat.h"
+#else
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
+#endif
 
 #include "imgcache.h"
 #include "config.h"

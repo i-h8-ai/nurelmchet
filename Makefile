@@ -1,16 +1,31 @@
 CC      = gcc
 
-# SDL3_image handled separately so a missing package doesn't break the SDL3 flags
+# Feature flags — override on the command line, e.g.: make TEXT_SELECT=0 USE_SDL2=1
+TEXT_SELECT ?= 1
+USE_SDL2    ?= 0
+
+ifeq ($(USE_SDL2),1)
+# SDL2 build — for Raspberry Pi OS where SDL3 is not packaged
+SDL_CFLAGS := $(shell pkg-config --cflags sdl2 SDL2_ttf SDL2_image 2>/dev/null)
+SDL_LIBS   := $(shell pkg-config --libs   sdl2 SDL2_ttf SDL2_image 2>/dev/null \
+                      || echo "-lSDL2 -lSDL2_ttf -lSDL2_image")
+SDL_DEFINE := -DUSE_SDL2
+else
+# SDL3 build (default)
 SDL3IMG_CFLAGS := $(shell pkg-config --cflags SDL3_image 2>/dev/null)
 SDL3IMG_LIBS   := $(shell pkg-config --libs   SDL3_image 2>/dev/null || echo "-lSDL3_image")
+SDL_CFLAGS := $(shell pkg-config --cflags sdl3 sdl3-ttf) $(SDL3IMG_CFLAGS)
+SDL_LIBS   := $(shell pkg-config --libs   sdl3 sdl3-ttf) $(SDL3IMG_LIBS)
+SDL_DEFINE :=
+endif
 
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE \
-          $(shell pkg-config --cflags sdl3 sdl3-ttf) \
-          $(SDL3IMG_CFLAGS) \
+          $(if $(filter 1,$(TEXT_SELECT)),-DENABLE_TEXT_SELECT) \
+          $(SDL_DEFINE) \
+          $(SDL_CFLAGS) \
           -I/usr/include/cjson
 
-LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf) \
-          $(SDL3IMG_LIBS) \
+LDFLAGS = $(SDL_LIBS) \
           -lcjson -lcurl -Wl,--no-as-needed -lssl -lcrypto -lpthread -lm
 
 SRCS = src/main.c src/chat.c src/ws.c src/gui.c src/console.c \
