@@ -1,6 +1,10 @@
 #pragma once
 #include <stdbool.h>
+#ifdef USE_SDL2
+#include "sdl_compat.h"
+#else
 #include <SDL3/SDL.h>
+#endif
 #include "config.h"
 
 typedef enum { IMG_STICKER, IMG_AVATAR } ImgType;
